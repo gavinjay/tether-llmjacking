@@ -1,0 +1,510 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  LLMjacking demo. "LlamaDesk" is a made-up startup whose support bot calls Amazon Bedrock from
+  its backend with a long-lived key. The key leaks from the company's own files, a reseller
+  replays it from outside, a network lock makes the stolen key useless, and the real fix removes
+  the key altogether. Includes detection, a dashboard and a SOC narrator.
+  Everything is prefixed llmjack-demo and is removed by deleting the stack.
+
+Parameters:
+  ModelId:
+    Type: String
+    Default: amazon.nova-micro-v1:0
+    Description: Model the product and the attacker call. Use an in-Region on-demand Nova model ID, or a Nova inference profile ID (for example us.amazon.nova-micro-v1:0).
+  NarratorModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+    Description: Nova model the SOC narrator uses to write up the incident.
+  AutoContain:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: If true, the first successful use of the key from outside the VPC applies the network lock automatically.
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address for incident alerts.
+  AzIndex:
+    Type: Number
+    Default: 0
+    Description: Index of the Availability Zone for the demo subnet. Change it if the Bedrock endpoint is not offered in the first AZ.
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+  # ---------- Network: a small private VPC whose only way out is the Bedrock endpoint ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.99.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: llmjack-demo}]
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.99.0.0/26
+      AvailabilityZone: !Select [!Ref AzIndex, !GetAZs '']
+      Tags: [{Key: Name, Value: llmjack-demo-private}]
+  AppSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: llmjack-demo app and endpoint
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 10.99.0.0/24}
+      Tags: [{Key: Name, Value: llmjack-demo}]
+  BedrockEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.bedrock-runtime
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref Subnet]
+      SecurityGroupIds: [!Ref AppSg]
+
+  # ---------- The company's mistake: an IAM user with a long-lived key ----------
+  AppUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: llmjack-demo-app
+      Policies:
+        - PolicyName: invoke-nova-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - arn:aws:bedrock:*::foundation-model/amazon.nova-*
+                  - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*amazon.nova-*
+  AppKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref AppUser
+
+  # ---------- Fix 1: the key only works through this VPC endpoint ----------
+  NetworkLock:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: llmjack-demo-network-lock
+      Description: Denies Bedrock unless the request arrives through the demo VPC endpoint.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: BedrockOnlyFromOurVpcEndpoint
+            Effect: Deny
+            Action: ['bedrock:*', 'bedrock-mantle:*']
+            Resource: '*'
+            Condition:
+              StringNotEquals:
+                aws:SourceVpce: !Ref BedrockEndpoint
+
+  # ---------- Roles ----------
+  AppRole:   # Fix 2 lives here: the product gets Bedrock access from its role, so there is no key to steal
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: llmjack-demo-app-lambda
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: invoke-nova-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - arn:aws:bedrock:*::foundation-model/amazon.nova-*
+                  - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*amazon.nova-*
+  BasicRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: llmjack-demo-basic-lambda
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  OpsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: llmjack-demo-ops-lambda
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ops
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [iam:AttachUserPolicy, iam:DetachUserPolicy]
+                Resource: !GetAtt AppUser.Arn
+                Condition:
+                  ArnEquals:
+                    iam:PolicyARN: !Ref NetworkLock
+              - Effect: Allow
+                Action: [iam:ListAttachedUserPolicies, iam:ListAccessKeys, iam:UpdateAccessKey]
+                Resource: !GetAtt AppUser.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+              - Effect: Allow
+                Action: logs:FilterLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/llmjack-demo-*
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/llmjack-demo-*:*
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - arn:aws:bedrock:*::foundation-model/amazon.nova-*
+                  - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*amazon.nova-*
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: llmjack-demo-alerts
+  AlertSub:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---------- Log groups (explicit so the dashboard and narrator can rely on them) ----------
+  CollectorLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /aws/lambda/llmjack-demo-collector, RetentionInDays: 30}
+  ControlLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /aws/lambda/llmjack-demo-control, RetentionInDays: 30}
+
+  # ---------- The product, as shipped: LlamaDesk support bot with a long-lived key in its config ----------
+  AppFn:
+    Type: AWS::Lambda::Function
+    DependsOn: BedrockEndpoint
+    Properties:
+      FunctionName: llmjack-demo-app
+      Description: LlamaDesk support bot backend. Anti-pattern - long-lived AWS key in its configuration.
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt AppRole.Arn
+      VpcConfig: {SubnetIds: [!Ref Subnet], SecurityGroupIds: [!Ref AppSg]}
+      Environment:
+        Variables: {USE_KEY: 'true', DEMO_AK: !Ref AppKey, DEMO_SK: !GetAtt AppKey.SecretAccessKey, MODEL: !Ref ModelId}
+      Code:
+        ZipFile: |
+          import os, boto3
+          from botocore.config import Config
+          kw = {}
+          if os.environ.get('USE_KEY') == 'true':   # the anti-pattern: a long-lived key in config
+              kw = dict(aws_access_key_id=os.environ['DEMO_AK'], aws_secret_access_key=os.environ['DEMO_SK'])
+          br = boto3.client('bedrock-runtime', config=Config(connect_timeout=5, read_timeout=20, retries={'max_attempts': 1}), **kw)
+          WHO = 'LlamaDesk support bot, inside the VPC, ' + ('long-lived key in config' if kw else 'IAM role and no stored key')
+          def handler(e, c):
+              q = e.get('question', 'How do I reset my password?')
+              try:
+                  r = br.converse(modelId=os.environ['MODEL'],
+                                  system=[{'text': 'You are a customer support bot. Answer in one short sentence.'}],
+                                  messages=[{'role': 'user', 'content': [{'text': q}]}],
+                                  inferenceConfig={'maxTokens': 40})
+                  return {'who': WHO, 'result': 'ALLOWED', 'customer_asked': q,
+                          'bot_answered': r['output']['message']['content'][0]['text'], 'tokens': r['usage']['totalTokens']}
+              except Exception as x:
+                  return {'who': WHO, 'result': 'FAILED', 'error': str(x)[:200]}
+
+  # ---------- The product, fixed: same code, no key anywhere. Access comes from the IAM role ----------
+  AppFixedFn:
+    Type: AWS::Lambda::Function
+    DependsOn: BedrockEndpoint
+    Properties:
+      FunctionName: llmjack-demo-app-fixed
+      Description: LlamaDesk support bot backend after the fix. IAM role, temporary credentials, nothing to steal.
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt AppRole.Arn
+      VpcConfig: {SubnetIds: [!Ref Subnet], SecurityGroupIds: [!Ref AppSg]}
+      Environment:
+        Variables: {USE_KEY: 'false', MODEL: !Ref ModelId}
+      Code:
+        ZipFile: |
+          import os, boto3
+          from botocore.config import Config
+          kw = {}
+          if os.environ.get('USE_KEY') == 'true':
+              kw = dict(aws_access_key_id=os.environ['DEMO_AK'], aws_secret_access_key=os.environ['DEMO_SK'])
+          br = boto3.client('bedrock-runtime', config=Config(connect_timeout=5, read_timeout=20, retries={'max_attempts': 1}), **kw)
+          WHO = 'LlamaDesk support bot, inside the VPC, ' + ('long-lived key in config' if kw else 'IAM role and no stored key')
+          def handler(e, c):
+              q = e.get('question', 'How do I reset my password?')
+              try:
+                  r = br.converse(modelId=os.environ['MODEL'],
+                                  system=[{'text': 'You are a customer support bot. Answer in one short sentence.'}],
+                                  messages=[{'role': 'user', 'content': [{'text': q}]}],
+                                  inferenceConfig={'maxTokens': 40})
+                  return {'who': WHO, 'result': 'ALLOWED', 'customer_asked': q,
+                          'bot_answered': r['output']['message']['content'][0]['text'], 'tokens': r['usage']['totalTokens']}
+              except Exception as x:
+                  return {'who': WHO, 'result': 'FAILED', 'error': str(x)[:200]}
+
+  # ---------- The attacker: a reseller serving its own paying customers off the stolen key ----------
+  AttackerFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: llmjack-demo-attacker
+      Description: Simulated reseller replaying the leaked demo key from outside the VPC. Hard-capped.
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 120
+      Role: !GetAtt BasicRole.Arn
+      Environment:
+        Variables: {DEMO_AK: !Ref AppKey, DEMO_SK: !GetAtt AppKey.SecretAccessKey, MODEL: !Ref ModelId}
+      Code:
+        ZipFile: |
+          import os, boto3
+          from botocore.config import Config
+          K = dict(aws_access_key_id=os.environ['DEMO_AK'], aws_secret_access_key=os.environ['DEMO_SK'])
+          def handler(e, c):
+              n = min(int(e.get('calls', 12)), 100)        # hard cap so the demo can never run up a bill
+              cust = max(1, min(int(e.get('customers', 3)), 5))
+              out = {'who': 'reseller, outside the VPC, selling access to %d of its own customers' % cust,
+                     'calls': n, 'allowed': 0, 'denied': 0, 'tokens_billed_to_victim': 0, 'per_customer': {}, 'errors': []}
+              try:   # first thing anyone does with a found key: check that it is alive
+                  out['whoami'] = boto3.client('sts', config=Config(retries={'max_attempts': 1}), **K).get_caller_identity()['Arn']
+              except Exception as x:
+                  out['whoami'] = 'failed: ' + str(x)[:120]
+              # each paying customer is tagged in the user agent so the dashboard can show the resale
+              cl = [boto3.client('bedrock-runtime', config=Config(retries={'max_attempts': 1},
+                    user_agent_extra='resold-to/customer-%d' % (i + 1)), **K) for i in range(cust)]
+              for i in range(n):
+                  name = 'customer-%d' % (i % cust + 1)
+                  try:
+                      r = cl[i % cust].converse(modelId=os.environ['MODEL'],
+                              messages=[{'role': 'user', 'content': [{'text': 'Write two sentences about llamas.'}]}],
+                              inferenceConfig={'maxTokens': 60})
+                      out['allowed'] += 1
+                      out['tokens_billed_to_victim'] += r['usage']['totalTokens']
+                      out['per_customer'][name] = out['per_customer'].get(name, 0) + 1
+                  except Exception as x:
+                      out['denied'] += 1
+                      if len(out['errors']) < 2:
+                          out['errors'].append(str(x)[:220])
+              out['result'] = 'KEY WORKS' if out['allowed'] else 'KEY IS USELESS'
+              return out
+
+  # ---------- Control: lock, unlock, status, enable, disable, leak ----------
+  ControlFn:
+    Type: AWS::Lambda::Function
+    DependsOn: ControlLogs
+    Properties:
+      FunctionName: llmjack-demo-control
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt OpsRole.Arn
+      Environment:
+        Variables: {DEMO_USER: !Ref AppUser, LOCK_ARN: !Ref NetworkLock, DEMO_AK: !Ref AppKey, DEMO_SK: !GetAtt AppKey.SecretAccessKey}
+      Code:
+        ZipFile: |
+          import os, json, boto3, datetime
+          iam = boto3.client('iam')
+          U, L, AK = os.environ['DEMO_USER'], os.environ['LOCK_ARN'], os.environ['DEMO_AK']
+          def status():
+              pol = [p['PolicyArn'] for p in iam.list_attached_user_policies(UserName=U)['AttachedPolicies']]
+              key = [k['Status'] for k in iam.list_access_keys(UserName=U)['AccessKeyMetadata'] if k['AccessKeyId'] == AK]
+              return {'network_lock': 'ON' if L in pol else 'OFF', 'key': key[0] if key else 'missing'}
+          def handler(e, c):
+              a = e.get('action', 'status')
+              if a == 'lock': iam.attach_user_policy(UserName=U, PolicyArn=L)
+              elif a == 'unlock': iam.detach_user_policy(UserName=U, PolicyArn=L)
+              elif a == 'disable': iam.update_access_key(UserName=U, AccessKeyId=AK, Status='Inactive')
+              elif a == 'enable': iam.update_access_key(UserName=U, AccessKeyId=AK, Status='Active')
+              elif a == 'leak':
+                  # Hands out the demo key on purpose, for the leak exhibits and a laptop replay. Not logged.
+                  return {'AWS_ACCESS_KEY_ID': AK, 'AWS_SECRET_ACCESS_KEY': os.environ['DEMO_SK']}
+              if a != 'status':
+                  print(json.dumps({'kind': 'control', 'action': a,
+                                    'eventTime': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}))
+              return dict(status(), action=a)
+
+  # ---------- Collector and responder: every Bedrock call by the product's identities lands here ----------
+  CollectorFn:
+    Type: AWS::Lambda::Function
+    DependsOn: CollectorLogs
+    Properties:
+      FunctionName: llmjack-demo-collector
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt OpsRole.Arn
+      Environment:
+        Variables: {DEMO_USER: !Ref AppUser, LOCK_ARN: !Ref NetworkLock, TOPIC: !Ref AlertTopic, AUTO_CONTAIN: !Ref AutoContain}
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          iam, sns = boto3.client('iam'), boto3.client('sns')
+          U, L, T = os.environ['DEMO_USER'], os.environ['LOCK_ARN'], os.environ['TOPIC']
+          AUTO = os.environ.get('AUTO_CONTAIN') == 'true'
+          last_alert = {'minute': None}
+          def handler(e, c):
+              d = e.get('detail', {})
+              ui = d.get('userIdentity') or {}
+              inside, denied = bool(d.get('vpcEndpointId')), bool(d.get('errorCode'))
+              if d.get('eventSource') == 'sts.amazonaws.com': v = 'recon_whoami'
+              elif ui.get('type') == 'AssumedRole': v = 'role_app_denied' if denied else 'role_app_ok'
+              elif inside: v = 'legit_app_denied' if denied else 'legit_app_ok'
+              else: v = 'stolen_key_blocked' if denied else 'stolen_key_succeeded'
+              ua = d.get('userAgent') or ''
+              rec = {'kind': 'bedrock_call', 'eventTime': d.get('eventTime'), 'eventName': d.get('eventName'),
+                     'verdict': v, 'sourceIP': d.get('sourceIPAddress'), 'vpcEndpointId': d.get('vpcEndpointId', 'none'),
+                     'errorCode': d.get('errorCode', 'none'), 'region': d.get('awsRegion'),
+                     'credential': 'temporary role credentials' if ui.get('type') == 'AssumedRole' else 'long-lived key ' + str(ui.get('accessKeyId')),
+                     'resoldTo': ua.split('resold-to/')[-1].split()[0][:20] if 'resold-to/' in ua else 'none',
+                     'modelId': (d.get('requestParameters') or {}).get('modelId', 'n/a'),
+                     'n_legit': int(v == 'legit_app_ok'), 'n_role': int(v == 'role_app_ok'),
+                     'n_stolen_ok': int(v == 'stolen_key_succeeded'), 'n_blocked': int(v == 'stolen_key_blocked'),
+                     'n_recon': int(v == 'recon_whoami')}
+              print(json.dumps(rec))
+              if v != 'stolen_key_succeeded':
+                  return rec
+              action = 'alert_only'
+              if AUTO:
+                  iam.attach_user_policy(UserName=U, PolicyArn=L)
+                  action = 'network_lock_applied'
+              inc = {'kind': 'incident', 'eventTime': d.get('eventTime'), 'sourceIP': rec['sourceIP'],
+                     'summary': 'Product key used from outside the VPC', 'action': action}
+              print(json.dumps(inc))
+              minute = (d.get('eventTime') or '')[:16]
+              if last_alert['minute'] != minute:
+                  last_alert['minute'] = minute
+                  sns.publish(TopicArn=T, Subject='LLMjacking demo: product key used from outside the VPC', Message=json.dumps(inc, indent=2))
+              return inc
+  CollectorRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: llmjack-demo-app-key-activity
+      Description: Every Bedrock or STS call made by the demo product's key or role, read-only calls included.
+      State: ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS
+      EventPattern:
+        source: [aws.bedrock, aws.sts]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          $or:
+            - userIdentity:
+                userName: [!Ref AppUser]
+            - userIdentity:
+                sessionContext:
+                  sessionIssuer:
+                    userName: [!Ref AppRole]
+      Targets:
+        - {Id: collector, Arn: !GetAtt CollectorFn.Arn}
+  CollectorPerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CollectorFn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CollectorRule.Arn
+
+  # ---------- SOC narrator: reads the evidence and tells the story ----------
+  NarratorFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: llmjack-demo-soc-narrator
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 120
+      Role: !GetAtt OpsRole.Arn
+      Environment:
+        Variables:
+          LOG_GROUPS: !Sub ${CollectorLogs},${ControlLogs}
+          MODEL: !Ref NarratorModelId
+      Code:
+        ZipFile: |
+          import os, json, time, boto3
+          logs, br = boto3.client('logs'), boto3.client('bedrock-runtime')
+          SYS = ('You are a senior SOC analyst briefing a non-specialist audience on an LLMjacking incident at '
+                 'LlamaDesk, a startup whose support bot calls Amazon Bedrock from its backend. Use ONLY the '
+                 'evidence given. Be clear that AWS was not breached: every call was a valid, correctly signed '
+                 'request made with the company own key, and the weakness was where the company kept that key. '
+                 'Verdicts: legit_app_ok = the product calling through its VPC endpoint with the long-lived key; '
+                 'recon_whoami = someone testing the key with GetCallerIdentity, which the product never does; '
+                 'stolen_key_succeeded = the key worked from outside the VPC; stolen_key_blocked = the key was '
+                 'denied from outside the VPC; role_app_ok = the product after the fix, using an IAM role with '
+                 'temporary credentials and no stored key. resoldTo names a paying customer of the reseller. '
+                 'Control actions lock/unlock toggle the network lock; an incident with action '
+                 'network_lock_applied means automatic containment. Write: 1) a one-paragraph summary, '
+                 '2) a timeline with times and source IPs, 3) what the attacker used the key for, '
+                 '4) how it was detected, 5) how it was blocked and proof the product kept working, '
+                 '6) what is still at risk and the next three actions. '
+                 'The evidence does not show how the key leaked; say that and list the usual places. '
+                 'If the evidence does not show something, say so. Plain language, no hype.')
+          def handler(e, c):
+              start = int((time.time() - int(e.get('minutes', 60)) * 60) * 1000)
+              ev = []
+              for g in os.environ['LOG_GROUPS'].split(','):
+                  for pg in logs.get_paginator('filter_log_events').paginate(logGroupName=g, startTime=start, filterPattern='{ $.kind = * }'):
+                      for x in pg['events']:
+                          try: ev.append(json.loads(x['message']))
+                          except Exception: pass
+              ev.sort(key=lambda r: r.get('eventTime') or '')
+              runs = []
+              for r in ev:
+                  k = (r['kind'], r.get('verdict') or r.get('action'), r.get('sourceIP'), r.get('errorCode'), r.get('resoldTo'), r.get('credential'))
+                  if runs and runs[-1]['k'] == k:
+                      runs[-1]['count'] += 1; runs[-1]['last'] = r.get('eventTime')
+                  else:
+                      runs.append({'k': k, 'kind': k[0], 'what': k[1], 'sourceIP': k[2], 'errorCode': k[3], 'resoldTo': k[4],
+                                   'credential': k[5], 'first': r.get('eventTime'), 'last': r.get('eventTime'), 'count': 1})
+              for r in runs: r.pop('k')
+              if not runs:
+                  return {'events': 0, 'narrative': 'No activity from the demo product in this window.'}
+              q = e.get('question') or 'Walk us through the whole incident from first sign to containment.'
+              r = br.converse(modelId=os.environ['MODEL'], system=[{'text': SYS}],
+                              messages=[{'role': 'user', 'content': [{'text': q + '\n\nEvidence (UTC):\n' + json.dumps(runs[-150:])}]}],
+                              inferenceConfig={'maxTokens': 1400, 'temperature': 0.2})
+              return {'events': len(ev), 'narrative': r['output']['message']['content'][0]['text']}
+
+  # ---------- Dashboard ----------
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: llmjack-demo
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"text","x":0,"y":0,"width":24,"height":3,"properties":{"markdown":"# LLMjacking demo: LlamaDesk support bot\nNobody hacked AWS here. Every call below is a valid, correctly signed request made with LlamaDesk's own key. The question is only **who** is holding the key and **where** they are calling from.\n\n**LegitApp**: the product, through its VPC endpoint. **StolenKeySucceeded**: the same key working from outside. **StolenKeyBlocked**: the same key denied from outside. **RoleBasedApp**: the product after the fix, with no key at all. Events arrive from CloudTrail, so allow a minute or two."}},
+          {"type":"log","x":0,"y":3,"width":16,"height":7,"properties":{"region":"${AWS::Region}","title":"Use of the product's Bedrock access, per minute","view":"timeSeries","stacked":true,
+            "query":"SOURCE '${CollectorLogs}' | filter kind = 'bedrock_call' | stats sum(n_legit) as LegitApp, sum(n_stolen_ok) as StolenKeySucceeded, sum(n_blocked) as StolenKeyBlocked, sum(n_recon) as Recon, sum(n_role) as RoleBasedApp by bin(1m)"}},
+          {"type":"log","x":16,"y":3,"width":8,"height":7,"properties":{"region":"${AWS::Region}","title":"Who the stolen key was resold to","view":"table",
+            "query":"SOURCE '${CollectorLogs}' | filter kind = 'bedrock_call' and resoldTo != 'none' | stats count(*) as calls by resoldTo, verdict, sourceIP | sort resoldTo asc"}},
+          {"type":"log","x":0,"y":10,"width":16,"height":8,"properties":{"region":"${AWS::Region}","title":"Latest calls","view":"table",
+            "query":"SOURCE '${CollectorLogs}' | filter kind = 'bedrock_call' | fields eventTime, verdict, credential, sourceIP, vpcEndpointId, resoldTo, errorCode, eventName, modelId | sort eventTime desc | limit 50"}},
+          {"type":"log","x":16,"y":10,"width":8,"height":8,"properties":{"region":"${AWS::Region}","title":"Incidents and containment","view":"table",
+            "query":"SOURCE '${CollectorLogs}' | SOURCE '${ControlLogs}' | filter kind = 'incident' or kind = 'control' | fields eventTime, kind, summary, action, sourceIP | sort eventTime desc | limit 30"}},
+          {"type":"log","x":0,"y":18,"width":24,"height":5,"properties":{"region":"${AWS::Region}","title":"Every source that has used the product's access","view":"table",
+            "query":"SOURCE '${CollectorLogs}' | filter kind = 'bedrock_call' | stats count(*) as calls, min(eventTime) as first_seen, max(eventTime) as last_seen by sourceIP, verdict, credential | sort calls desc"}},
+          {"type":"metric","x":0,"y":23,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Bedrock invocations for ${ModelId} (whole account)","view":"timeSeries","stat":"Sum","period":60,
+            "metrics":[["AWS/Bedrock","Invocations","ModelId","${ModelId}"],[".","InvocationClientErrors",".","."]]}},
+          {"type":"metric","x":12,"y":23,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Tokens for ${ModelId} (whole account)","view":"timeSeries","stat":"Sum","period":60,
+            "metrics":[["AWS/Bedrock","InputTokenCount","ModelId","${ModelId}"],[".","OutputTokenCount",".","."]]}}
+        ]}
+
+Outputs:
+  DashboardUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/llmjack-demo
+  VpcEndpointId:
+    Value: !Ref BedrockEndpoint
+  DemoUser:
+    Value: !Ref AppUser
