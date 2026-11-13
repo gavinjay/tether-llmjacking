@@ -71,6 +71,9 @@ Resources:
     Type: AWS::IAM::User
     Properties:
       UserName: llmjack-demo-app
+      Tags:   # Bedrock cost allocation by IAM principal (April 2026): activate these tags in Billing to see spend per identity
+        - {Key: team, Value: llamadesk-support}
+        - {Key: project, Value: tether-demo}
       Policies:
         - PolicyName: invoke-nova-only
           PolicyDocument:
@@ -108,6 +111,9 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: llmjack-demo-app-lambda
+      Tags:
+        - {Key: team, Value: llamadesk-support}
+        - {Key: project, Value: tether-demo}
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]

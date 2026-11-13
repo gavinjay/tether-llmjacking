@@ -61,6 +61,7 @@ developer laptops, and exposed gateway admin pages.
 | Collector | EventBridge rule on CloudTrail catches every call, labels it, and can apply the lock automatically |
 | Dashboard | `llmjack-demo`: legit, stolen, blocked and role-based calls per minute, who the key was resold to, incidents |
 | SOC narrator | Lambda that reads the evidence, writes the walkthrough and answers follow-up questions |
+| Cost attribution tags | The product's IAM user and role carry `team` and `project` tags, for Bedrock cost allocation by IAM principal. Activate the tags in Billing to see spend per identity |
 
 Everything is named `llmjack-demo*`. The key and the role can only invoke Amazon Nova models.
 
