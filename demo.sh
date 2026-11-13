@@ -2,7 +2,9 @@
 # LLMjacking demo driver. Run it in AWS CloudShell in the Region where the stack lives.
 #   ./demo.sh deploy            create the stack (about 4 minutes)
 #   ./demo.sh run               the full story, start to finish
-#   ./demo.sh app|exhibits|scan|attack|lock|unlock|fixed|status|narrate   one step at a time
+#   ./demo.sh app|exhibits|find|attack|lock|unlock|fixed|status|narrate   one step at a time
+#   ./demo.sh scan              Tether Scan: read-only exposure check of this account
+#   ./demo.sh guardduty-on|guardduty-samples|investigate|cost-watch   the newer AWS detection services
 #   ./demo.sh ask "question"    ask the SOC narrator anything about the evidence
 #   ./demo.sh leak              print the demo key as export lines, for a laptop replay
 #   ./demo.sh park              disable the key between demos (unpark to re-enable)
@@ -97,7 +99,7 @@ case "${1:-help}" in
   app)      call app "$(python3 -c 'import json,sys;print(json.dumps({"question":sys.argv[1]}))' "${2:-How do I reset my password?}")" ;;
   fixed)    call app-fixed "$(python3 -c 'import json,sys;print(json.dumps({"question":sys.argv[1]}))' "${2:-How do I reset my password?}")" ;;
   exhibits) exhibits ;;
-  scan)     scan ;;
+  find)     scan ;;
   attack)   call attacker "{\"calls\": ${2:-12}, \"customers\": ${3:-3}}" ;;
   lock)     call control '{"action":"lock"}' ;;
   unlock)   call control '{"action":"unlock"}' ;;
@@ -131,10 +133,38 @@ case "${1:-help}" in
     note "Nothing to leak. Exhibits A to D would all come up empty."
     say "ACT 6. Waiting 2 minutes for CloudTrail to deliver the evidence"; sleep 120
     say "        SOC narrator"; narrate '{"minutes": 30}' ;;
+  guardduty-on)   # turns on AI Protection and the Investigation preview. Account setting: fails in org-managed member accounts
+    DET=$(aws guardduty list-detectors --query 'DetectorIds[0]' --output text)
+    [ "$DET" = "None" ] && { echo "GuardDuty is not enabled in this Region."; exit 1; }
+    aws guardduty update-detector --detector-id "$DET" \
+      --features '[{"Name":"AI_PROTECTION","Status":"ENABLED"},{"Name":"AI_ANALYST","Status":"ENABLED"}]'
+    aws guardduty get-detector --detector-id "$DET" \
+      --query 'Features[?Name==`AI_PROTECTION` || Name==`AI_ANALYST`].[Name,Status]' --output table ;;
+  guardduty-samples)   # real findings need a learned baseline, so show the shape with samples. They are labelled as samples
+    DET=$(aws guardduty list-detectors --query 'DetectorIds[0]' --output text)
+    aws guardduty create-sample-findings --detector-id "$DET" \
+      --finding-types Impact:IAMUser/CostHarvesting Impact:IAMUser/AnomalousModelInvocation
+    echo "Sample findings requested. They reach the dashboard within a few minutes." ;;
+  investigate)   # GuardDuty Investigation (preview): AWS's AI analyst. Pass a finding ID, or nothing for an account-level review
+    DET=$(aws guardduty list-detectors --query 'DetectorIds[0]' --output text)
+    ACCT=$(aws sts get-caller-identity --query Account --output text)
+    PROMPT="Investigate account $ACCT for misuse of Amazon Bedrock with compromised credentials"
+    [ -n "${2:-}" ] && PROMPT="Investigate finding $2 in account $ACCT"
+    ID=$(aws guardduty create-investigation --detector-id "$DET" --trigger-prompt "$PROMPT" --query InvestigationId --output text)
+    echo "Investigation $ID started. It runs in the background. Fetch it with:"
+    echo "  aws guardduty get-investigation --detector-id $DET --investigation-id $ID" ;;
+  cost-watch)   # Cost Anomaly Detection on Bedrock spend, alerting the demo SNS topic
+    TOPIC=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':llmjack-demo-alerts')].TopicArn | [0]" --output text)
+    MON=$(aws ce create-anomaly-monitor --region us-east-1 --query MonitorArn --output text --anomaly-monitor \
+      '{"MonitorName":"llmjack-demo-bedrock","MonitorType":"CUSTOM","MonitorSpecification":{"Dimensions":{"Key":"SERVICE","Values":["Amazon Bedrock"]}}}')
+    aws ce create-anomaly-subscription --region us-east-1 --anomaly-subscription \
+      "{\"SubscriptionName\":\"llmjack-demo-bedrock\",\"MonitorArnList\":[\"$MON\"],\"Subscribers\":[{\"Type\":\"SNS\",\"Address\":\"$TOPIC\"}],\"Frequency\":\"IMMEDIATE\",\"ThresholdExpression\":{\"Dimensions\":{\"Key\":\"ANOMALY_TOTAL_IMPACT_ABSOLUTE\",\"MatchOptions\":[\"GREATER_THAN_OR_EQUAL\"],\"Values\":[\"1\"]}}}"
+    echo "Monitor $MON created. Remove it with: aws ce delete-anomaly-monitor --region us-east-1 --monitor-arn $MON" ;;
+  scan)  shift; python3 tether_scan.py "$@" ;;
   destroy)
     rm -rf "$EX"
     call control '{"action":"unlock"}' || true   # an attached policy would block deleting the user
     aws cloudformation delete-stack --stack-name $STACK
     aws cloudformation wait stack-delete-complete --stack-name $STACK && echo "Deleted." ;;
-  *) sed -n '2,10p' "$0" ;;
+  *) sed -n '2,12p' "$0" ;;
 esac

@@ -77,11 +77,43 @@ Pick a Region where the model in `ModelId` can be called directly. To use an inf
 
 Self-healing variant, where detection applies the lock on its own: `./demo.sh deploy AutoContain=true`
 
-Each act can be run alone: `app`, `exhibits`, `scan`, `attack`, `lock`, `unlock`, `fixed`, `narrate`.
+Each act can be run alone: `app`, `exhibits`, `find`, `attack`, `lock`, `unlock`, `fixed`, `narrate`.
 For extra effect, replay the key from your own laptop: `./demo.sh leak`, copy the two export lines
 to the laptop, then `python3 replay_from_laptop.py`.
 
 Ask the narrator anything: `./demo.sh ask "Who was the key resold to and how many calls did each make?"`
+
+## Tether Scan: the automated check
+
+`python3 tether_scan.py` (or `./demo.sh scan`) is a read-only scan of any AWS account. It answers "how exposed are we
+to stolen-key abuse of Bedrock?" with evidence, in four sections that match what AWS asks partners to help with:
+
+| Section | What it checks |
+|---|---|
+| 1. Access key hygiene | Every active IAM access key: age, last use, never-used and dormant keys, root keys, root MFA, alternate contacts |
+| 2. Roles instead of long-lived keys | Long-term Bedrock API keys, IAM users holding broad Bedrock policies, whether a Bedrock VPC endpoint exists to tie access to |
+| 3. Detection and cost alerts | GuardDuty AI Protection and Investigation status, Bedrock invocation logging, Cost Anomaly Detection subscribers, Budgets and budget actions |
+| 4. Review readiness | Security Hub and unused-access analysis |
+
+It writes `tether-scan.md` and `tether-scan.json`. It only calls List, Get and Describe APIs and reads no secret values.
+A check it cannot run is reported as UNKNOWN, never as a pass. The report names IAM users, so treat it as confidential.
+
+Status: the key-classification logic is unit-tested, and the credential-report parsing was checked against one live
+account. The script has not yet been run end to end with a role that can read every service.
+
+## The newer AWS services
+
+| Command | AWS capability | What it does |
+|---|---|---|
+| `./demo.sh guardduty-on` | GuardDuty AI Protection (Jul 2026), GuardDuty Investigation preview (Jun 2026) | Enables both features on the detector. Fails in member accounts managed by an organization administrator |
+| `./demo.sh guardduty-samples` | GuardDuty AI Protection | Creates sample cost-harvesting and anomalous-invocation findings. The stack routes real and sample findings to the dashboard and the narrator, labelled |
+| `./demo.sh investigate [finding-id]` | GuardDuty Investigation | Starts an AI investigation of a finding, or of the whole account |
+| `./demo.sh cost-watch` | Cost Anomaly Detection | Creates a Bedrock spend monitor with an immediate alert to the demo SNS topic |
+| `policies/` | Bedrock API key condition keys (Sep 2025) | A ready policy that blocks long-term Bedrock keys, and the network lock as a reusable policy or SCP |
+| IAM tags in the template | Bedrock cost allocation by IAM principal (Apr 2026) | Activate the `team` and `project` tags in Billing to see spend per identity |
+
+None of these commands has been run against a live account yet. AI-powered cost investigations (Amazon Q) are a
+console button on a detected anomaly, so there is nothing to script.
 
 ## What the lock does not stop (say this before someone asks)
 

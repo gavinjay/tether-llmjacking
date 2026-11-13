@@ -1,0 +1,26 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyUsingLongTermBedrockApiKeys",
+      "Effect": "Deny",
+      "Action": "bedrock:CallWithBearerToken",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "bedrock:bearerTokenType": "LONG_TERM" } }
+    },
+    {
+      "Sid": "DenyUsingLongTermBedrockMantleApiKeys",
+      "Effect": "Deny",
+      "Action": "bedrock-mantle:CallWithBearerToken",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "bedrock-mantle:bearerTokenType": "LONG_TERM" } }
+    },
+    {
+      "Sid": "DenyCreatingLongTermBedrockApiKeys",
+      "Effect": "Deny",
+      "Action": "iam:CreateServiceSpecificCredential",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "iam:ServiceSpecificCredentialServiceName": "bedrock.amazonaws.com" } }
+    }
+  ]
+}

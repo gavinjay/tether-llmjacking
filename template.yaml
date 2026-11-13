@@ -179,6 +179,18 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: llmjack-demo-alerts
+  AlertTopicPolicy:   # lets Cost Anomaly Detection publish alerts (used by ./demo.sh cost-watch)
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCostAnomalyAlerts
+            Effect: Allow
+            Principal: {Service: costalerts.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
   AlertSub:
     Type: AWS::SNS::Subscription
     Condition: HasEmail
@@ -366,6 +378,12 @@ Resources:
           last_alert = {'minute': None}
           def handler(e, c):
               d = e.get('detail', {})
+              if e.get('source') == 'aws.guardduty':   # GuardDuty AI Protection finding
+                  g = {'kind': 'guardduty_finding', 'eventTime': d.get('updatedAt') or e.get('time'), 'type': d.get('type'),
+                       'severity': d.get('severity'), 'title': d.get('title'), 'findingId': d.get('id'),
+                       'sample': bool(((d.get('service') or {}).get('additionalInfo') or {}).get('sample'))}
+                  print(json.dumps(g))
+                  return g
               ui = d.get('userIdentity') or {}
               inside, denied = bool(d.get('vpcEndpointId')), bool(d.get('errorCode'))
               if d.get('eventSource') == 'sts.amazonaws.com': v = 'recon_whoami'
@@ -416,6 +434,29 @@ Resources:
                     userName: [!Ref AppRole]
       Targets:
         - {Id: collector, Arn: !GetAtt CollectorFn.Arn}
+  GuardDutyRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: llmjack-demo-guardduty-ai-findings
+      Description: GuardDuty AI Protection findings (cost harvesting, anomalous model invocation, prompt injection).
+      State: ENABLED
+      EventPattern:
+        source: [aws.guardduty]
+        detail-type: [GuardDuty Finding]
+        detail:
+          type:
+            - Impact:IAMUser/CostHarvesting
+            - Impact:IAMUser/AnomalousModelInvocation
+            - Impact:IAMUser/PromptInjection.Direct
+      Targets:
+        - {Id: collector, Arn: !GetAtt CollectorFn.Arn}
+  GuardDutyPerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CollectorFn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GuardDutyRule.Arn
   CollectorPerm:
     Type: AWS::Lambda::Permission
     Properties:
@@ -451,7 +492,8 @@ Resources:
                  'denied from outside the VPC; role_app_ok = the product after the fix, using an IAM role with '
                  'temporary credentials and no stored key. resoldTo names a paying customer of the reseller. '
                  'Control actions lock/unlock toggle the network lock; an incident with action '
-                 'network_lock_applied means automatic containment. Write: 1) a one-paragraph summary, '
+                 'network_lock_applied means automatic containment. kind guardduty_finding is an Amazon GuardDuty AI '
+                 'Protection finding; if sample is true it is a sample finding, so say that. Write: 1) a one-paragraph summary, '
                  '2) a timeline with times and source IPs, 3) what the attacker used the key for, '
                  '4) how it was detected, 5) how it was blocked and proof the product kept working, '
                  '6) what is still at risk and the next three actions. '
@@ -468,7 +510,7 @@ Resources:
               ev.sort(key=lambda r: r.get('eventTime') or '')
               runs = []
               for r in ev:
-                  k = (r['kind'], r.get('verdict') or r.get('action'), r.get('sourceIP'), r.get('errorCode'), r.get('resoldTo'), r.get('credential'))
+                  k = (r['kind'], r.get('verdict') or r.get('action') or r.get('type'), r.get('sourceIP'), r.get('errorCode'), r.get('resoldTo'), r.get('credential'))
                   if runs and runs[-1]['k'] == k:
                       runs[-1]['count'] += 1; runs[-1]['last'] = r.get('eventTime')
                   else:
@@ -499,6 +541,8 @@ Resources:
             "query":"SOURCE '${CollectorLogs}' | filter kind = 'bedrock_call' | fields eventTime, verdict, credential, sourceIP, vpcEndpointId, resoldTo, errorCode, eventName, modelId | sort eventTime desc | limit 50"}},
           {"type":"log","x":16,"y":10,"width":8,"height":8,"properties":{"region":"${AWS::Region}","title":"Incidents and containment","view":"table",
             "query":"SOURCE '${CollectorLogs}' | SOURCE '${ControlLogs}' | filter kind = 'incident' or kind = 'control' | fields eventTime, kind, summary, action, sourceIP | sort eventTime desc | limit 30"}},
+          {"type":"log","x":0,"y":29,"width":24,"height":5,"properties":{"region":"${AWS::Region}","title":"GuardDuty AI Protection findings","view":"table",
+            "query":"SOURCE '${CollectorLogs}' | filter kind = 'guardduty_finding' | fields eventTime, type, severity, title, sample, findingId | sort eventTime desc | limit 20"}},
           {"type":"log","x":0,"y":18,"width":24,"height":5,"properties":{"region":"${AWS::Region}","title":"Every source that has used the product's access","view":"table",
             "query":"SOURCE '${CollectorLogs}' | filter kind = 'bedrock_call' | stats count(*) as calls, min(eventTime) as first_seen, max(eventTime) as last_seen by sourceIP, verdict, credential | sort calls desc"}},
           {"type":"metric","x":0,"y":23,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Bedrock invocations for ${ModelId} (whole account)","view":"timeSeries","stat":"Sum","period":60,

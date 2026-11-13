@@ -1,0 +1,12 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BedrockOnlyFromOurVpcEndpoints",
+      "Effect": "Deny",
+      "Action": ["bedrock:*", "bedrock-mantle:*"],
+      "Resource": "*",
+      "Condition": { "StringNotEquals": { "aws:SourceVpce": ["vpce-REPLACE_WITH_YOUR_ENDPOINT_ID"] } }
+    }
+  ]
+}
